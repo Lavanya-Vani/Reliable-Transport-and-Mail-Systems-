@@ -1,0 +1,210 @@
+================================================================================
+  KTP (KGP Transport Protocol) — Mini Project 1
+  CS39006: Networks Laboratory, Spring 2025-26
+================================================================================
+  Member 1: M Lekhya Reddy    (23CS10039)
+  Member 2: Y. Lavanya Vani   (23CS10082)
+================================================================================
+
+
+1. RESULTS TABLE
+
+  ┌──────┬─────────────────────────────┬──────────────────────────────────────┐
+  │  p   │ Avg transmissions/message   │ Remarks                              │
+  ├──────┼─────────────────────────────┼──────────────────────────────────────┤
+  │ 0.05 │ ~1.10                       │ Barely any retransmissions           │
+  │ 0.10 │ ~1.22                       │ Few timeouts                         │
+  │ 0.15 │ ~1.40                       │ Window stalls occasionally           │
+  │ 0.20 │ ~1.65                       │ Timeouts getting frequent            │
+  │ 0.25 │ ~2.00                       │ Noticeable overhead                  │
+  │ 0.30 │ ~2.45                       │ Window stalls often                  │
+  │ 0.35 │ ~3.00                       │ Lots of retransmissions              │
+  │ 0.40 │ ~3.70                       │ Very slow transfer                   │
+  │ 0.45 │ ~4.90                       │ Almost every window needs retry      │
+  │ 0.50 │ ~6.20                       │ Very bad, cascading timeouts         │
+  └──────┴─────────────────────────────┴──────────────────────────────────────┘
+
+  avg_transmissions = total DATA packets sent by Thread S / total messages
+
+  Note: When a timeout happens, the whole window is retransmitted (not just
+  the lost packet), so the overhead grows faster than linearly with p.
+  At p=0.5 it's roughly 6x the ideal case.
+
+
+2. DATA STRUCTURES
+
+  KTPHeader  (4 bytes, goes at the front of every UDP packet)
+  ┌───────────┬──────────────────────────────────────────────────────────────┐
+  │ type      │ KTP_DATA=0x01, KTP_ACK=0x02, KTP_DUPACK=0x04                │
+  │ seq_num   │ For data: sequence number. For ACK: last in-order seq seen  │
+  │ rwnd_size │ How many free slots the receiver has right now              │
+  │ pad       │ Unused, set to 0                                            │
+  └───────────┴──────────────────────────────────────────────────────────────┘
+
+  MsgSlot  (one slot in send_buf[] or recv_buf[])
+  ┌──────────────┬────────────────────────────────────────────────────────────┐
+  │ occupied     │ 1 = slot is in use, 0 = empty                             │
+  │ seq_num      │ Sequence number assigned to this message                  │
+  │ sent         │ 1 = already sent by Thread S (so we don't send it twice)  │
+  │ insert_order │ Counter to maintain the order messages were added         │
+  │ data[512]    │ The actual 512-byte message content                       │
+  └──────────────┴────────────────────────────────────────────────────────────┘
+
+  SWnd  (sender's window)
+  ┌────────────────┬──────────────────────────────────────────────────────────┐
+  │ size           │ How many unACKed messages we can have at once            │
+  │ next_seq       │ Next sequence number to use (1 to 255, skips 0)         │
+  │ unacked[256]   │ Sequence numbers sent but not yet ACKed                 │
+  │ unacked_count  │ How many are in unacked[]                               │
+  │ last_sent_time │ When we last sent something (to check for timeout)      │
+  └────────────────┴──────────────────────────────────────────────────────────┘
+
+  RWnd  (receiver's window)
+  ┌──────────────────┬────────────────────────────────────────────────────────┐
+  │ size             │ Number of free slots in recv_buf (= current rwnd)      │
+  │ expected_seq     │ The next sequence number we're waiting for             │
+  │ received[256]    │ Bitmap to track which sequence numbers we have stored. │
+  │                  │ Cleared as expected_seq moves forward (for wraparound) │
+  │ last_inorder_seq │ Last seq number received in order; put in every ACK   │
+  └──────────────────┴────────────────────────────────────────────────────────┘
+
+  KTPSocket  (one entry in shared memory)
+  ┌──────────────┬──────────────────────────────────────────────────────────┐
+  │ state        │ SLOT_FREE / REQUESTED / READY / BIND_NEEDED / BOUND /   │
+  │              │ CLOSING  — tracks the handshake between user and init    │
+  │ pid          │ PID of whoever created this socket (for garbage collect) │
+  │ src_addr     │ Local IP:Port                                            │
+  │ dst_addr     │ Remote IP:Port                                           │
+  │ is_bound     │ Set to 1 after initksocket successfully does bind()      │
+  │ send_buf[50] │ Messages waiting to be sent (app writes here)            │
+  │ recv_buf[10] │ Messages received (app reads from here); max 10 per spec │
+  │ swnd / rwnd  │ Sender and receiver window structs                       │
+  │ nospace_flag │ Set when recv_buf is full; cleared on next data packet   │
+  │ send_order   │ Counter to remember which message was added first        │
+  │ deliver_seq  │ Next sequence number that k_recvfrom() should give out   │
+  └──────────────┴──────────────────────────────────────────────────────────┘
+
+  SharedMem: holds 10 KTPSocket entries in shared memory (key 0x4B545031).
+             One semaphore per socket slot for mutual exclusion (key 0x4B545032).
+
+  udp_fds[10]: array of UDP socket fds, only inside initksocket. User processes
+               don't touch these at all.
+
+
+3. FUNCTION DESCRIPTIONS
+
+--- ksocket.c ---
+  get_shared_memory(create)   Opens or creates the shared memory segment.
+  get_semaphores(create)      Opens or creates the semaphore set (10 semaphores,
+                              each initialized to 1).
+  sem_lock / sem_unlock       Acquire / release the semaphore for a slot.
+  dropMessage(p)              Randomly returns 1 with probability p to simulate
+                              packet loss. Called after every recvfrom().
+
+  k_socket()    Finds a free slot in shared memory, sets it up with initial
+                values, marks it SLOT_REQUESTED, and waits for initksocket
+                to create the UDP socket (SLOT_READY). Returns the slot index.
+
+  k_bind()      Puts src and dst addresses into shared memory, marks
+                SLOT_BIND_NEEDED, and waits for initksocket to call bind()
+                and set SLOT_BOUND.
+
+  k_sendto()    Writes a message into send_buf[] with an insert_order stamp
+                so Thread S knows what to send first. Returns -1 if no space
+                or socket isn't bound yet.
+
+  k_recvfrom()  Looks for the slot in recv_buf[] whose seq_num matches
+                deliver_seq. If found, returns it and moves deliver_seq
+                forward. If not found yet, returns -1/ENOMESSAGE.
+
+  k_close()     Marks the slot SLOT_CLOSING and waits for initksocket
+                to clean everything up.
+
+--- initksocket.c ---
+
+  count_free_recv(ks)    Returns number of empty slots in recv_buf[].
+                         Must be called while holding the semaphore.
+
+  service_handshakes()   Checks all slots for pending transitions:
+                           REQUESTED  → creates UDP socket → READY
+                           BIND_NEEDED → calls bind()     → BOUND
+                           CLOSING    → closes socket     → FREE
+                         Does the actual syscalls outside the semaphore lock.
+
+  thread_R()    Listens for incoming packets on all bound UDP sockets:
+                1. Calls service_handshakes() each loop.
+                2. Uses select() with 1-second timeout.
+                3. On timeout: if recv_buf had space again after being
+                   full, sends a DUPACK to wake up the sender.
+                4. On DATA packet: simulate drop → check window bounds
+                   and duplicates → store in recv_buf → update expected_seq
+                   (clearing the bitmap as it goes) → send ACK only if
+                   the packet was in-order.
+                5. On ACK: free the matching send_buf slots, update swnd.size.
+                6. On DUPACK: just update swnd.size.
+                sendto() is always called after releasing the semaphore.
+
+  thread_S()    Checks every 50ms for things to send:
+                1. If it's been T seconds since last send and there are
+                   unACKed messages, retransmit all of them.
+                2. Otherwise, pick the oldest unsent message from send_buf[]
+                   (using insert_order), assign a seq number, and send it.
+                All building happens under the lock; sending happens after.
+
+  garbage_collector()   Runs as a child process. Every 5 seconds, checks
+                        if each socket's owner process is still alive.
+                        If not, marks the slot for cleanup.
+
+  cleanup()     Called on Ctrl+C. Closes all sockets, removes shared memory
+                and semaphores.
+
+  main()        Cleans up any leftover IPC from previous runs, sets up shared
+                memory and semaphores, forks the garbage collector, then
+                starts Thread R and Thread S.
+
+--- user1.c ---
+
+  send_file(kfd, fname)   Opens the file, reads it in 512-byte chunks, and
+                          calls k_sendto() for each one (retries if buffer
+                          full). Waits until everything is ACKed before
+                          returning.
+
+  main()    Creates and binds a KTP socket. Loops asking the user for a
+            filename. Sends the file, then asks again. Type EXIT to stop.
+
+--- user2.c ---
+
+  stdin_watcher()   A separate thread that watches for the user typing EXIT.
+                    Sets exit_flag = 1 when that happens.
+
+  main()    Creates and binds a KTP socket. Continuously calls k_recvfrom()
+            to receive messages, prints them on screen and writes to
+            received_output.txt. Stops only when the user types EXIT —
+            not based on any timeout, so it won't quit mid-transfer.
+
+
+4. PROTOCOL 
+
+  Packet format (516 bytes total):
+    [ type(1B) | seq_num(1B) | rwnd_size(1B) | pad(1B) ] + data(512B)
+
+  Sequence numbers go from 1 to 255 (0 is skipped), wrapping back to 1.
+  ACKs are cumulative — they carry the last in-order seq received.
+  To check if seq s is ACKed: (acked - s) mod 256 <= 128.
+
+  State machine for each socket slot:
+    FREE → REQUESTED → READY → BIND_NEEDED → BOUND → CLOSING → FREE
+
+--> Some important implementations ........
+
+  - sendto() is never called while holding a semaphore — this prevents
+    Thread R and Thread S from deadlocking on each other.
+  - nospace_flag is only cleared when a new DATA packet arrives (not when
+    the DUPACK is sent), so even if the DUPACK gets dropped, the timeout
+    loop will keep retrying and the transfer won't get stuck.
+  - deliver_seq makes sure k_recvfrom() always hands messages to the app
+    in the correct order, even if they arrived out of order.
+  - The received[] bitmap is cleared as expected_seq moves forward, which
+    is important for when sequence numbers wrap around (255 → 1).
+  - send_buf uses insert_order so Thread S always sends the oldest message
+    first, preserving the order the app wrote them.
