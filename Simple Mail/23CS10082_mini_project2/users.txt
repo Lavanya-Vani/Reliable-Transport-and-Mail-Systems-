@@ -1,5 +1,0 @@
-alice secretpass1
-bob hunter2
-charlie x9Kp2mW
-diana pass1234
-eve qwerty99
